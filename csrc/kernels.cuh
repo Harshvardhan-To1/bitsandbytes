@@ -4,6 +4,7 @@
 // LICENSE file in the root directory of this source tree.
 
 #include <float.h>
+#include <cstdint>
 #include <ops.cuh>
 
 #ifndef kernels
@@ -15,11 +16,11 @@ __global__ void kDequantize(float* code, unsigned char* A, float* out, const int
 template <typename T, int BLOCK_SIZE, int NUM_PER_TH, int STOCHASTIC, int DATA_TYPE>
 __global__ void kQuantizeBlockwise(
     float* code, T* __restrict__ const A, float* absmax, unsigned char* out, float* __restrict__ const rand,
-    const int rand_offset, const int n
+    const int rand_offset, const int64_t n
 );
 template <typename T, int BLOCK_SIZE, int THREADS, int NUM_PER_TH, int DATA_TYPE>
 __global__ void
-    kDequantizeBlockwise(float* code, unsigned char* A, float* absmax, T* out, const int blocksize, const int n);
+    kDequantizeBlockwise(float* code, unsigned char* A, float* absmax, T* out, const int blocksize, const int64_t n);
 
 template <typename T, int OPTIMIZER, int BLOCK_SIZE, int NUM_VALS>
 __global__ void kPreconditionOptimizer32bit2State(
@@ -106,11 +107,11 @@ __global__ void kspmm_coo_very_sparse_naive(
 template <int ITEMS_PER_THREAD, int THREADS>
 __global__ void kdequant_mm_int32_fp16(
     int* __restrict__ const A, float* __restrict__ const rowStats, float* __restrict__ const colStats, half* out,
-    half* __restrict__ const bias, const int numRows, const int numCols, const int n
+    half* __restrict__ const bias, const int numRows, const int numCols, const int64_t n
 );
 
 template <typename T, int THREADS, int SPARSE_DECOMP>
-__global__ void kInt8VectorQuant(T* __restrict__ A, int8_t* out, float* rowStats, float threshold, int rows, int cols);
+__global__ void kInt8VectorQuant(T* __restrict__ A, int8_t* out, float* rowStats, float threshold, int64_t rows, int cols);
 
 template <typename T, int THREADS, int BITS>
 __global__ void kgemm_4bit_inference_naive(
