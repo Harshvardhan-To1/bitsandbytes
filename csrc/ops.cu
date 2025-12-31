@@ -30,10 +30,18 @@ void dequantize(float* code, unsigned char* A, float* out, int n, cudaStream_t s
 
 template <typename T, int STOCHASTIC, int DATA_TYPE>
 void quantizeBlockwise(
-    float* code, T* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+    float* code,
+    T* A,
+    float* absmax,
+    unsigned char* out,
+    float* rand,
+    int rand_offset,
+    int blocksize,
+    const int64_t n
 ) {
-    int num_blocks = n / blocksize;
-    num_blocks = n % blocksize == 0 ? num_blocks : num_blocks + 1;
+    const int64_t num_blocks64 = (n + blocksize - 1) / blocksize;
+    const int max_blocks = std::numeric_limits<int>::max();
+    const int num_blocks = num_blocks64 > max_blocks ? max_blocks : static_cast<int>(num_blocks64);
 
     if (blocksize == 4096)
         kQuantizeBlockwise<T, 4096, 4, STOCHASTIC, DATA_TYPE>
@@ -56,12 +64,14 @@ void quantizeBlockwise(
 
 template <typename T, int DATA_TYPE>
 void dequantizeBlockwise(
-    float* code, unsigned char* A, float* absmax, T* out, int blocksize, const int n, cudaStream_t stream
+    float* code, unsigned char* A, float* absmax, T* out, int blocksize, const int64_t n, cudaStream_t stream
 ) {
     constexpr int tile_size = (DATA_TYPE > 0) ? 1024 : 512;
 
-    // Upcast to int64 to avoid overflow for large n
-    int grid_blocks = ((int64_t)n + tile_size - 1) / tile_size;
+    const int64_t n_in = (DATA_TYPE > 0) ? ((n + 1) / 2) : n;
+    const int64_t grid_blocks64 = (n_in + tile_size - 1) / tile_size;
+    const int max_blocks = std::numeric_limits<int>::max();
+    const int grid_blocks = grid_blocks64 > max_blocks ? max_blocks : static_cast<int>(grid_blocks64);
 
     if (DATA_TYPE > 0)
         kDequantizeBlockwise<T, 512, 64, 8, DATA_TYPE>
@@ -372,8 +382,10 @@ void dequant_mm_int32_fp16(
     const int threads = 512;
     const int num_per_thread = 4;
     const int num_per_block = threads * num_per_thread;
-    const int n = numRows * numCols;
-    const int num_blocks = (n + num_per_block - 1) / num_per_block;
+    const int64_t n = static_cast<int64_t>(numRows) * static_cast<int64_t>(numCols);
+    const int64_t num_blocks64 = (n + num_per_block - 1) / num_per_block;
+    const int max_blocks = std::numeric_limits<int>::max();
+    const int num_blocks = num_blocks64 > max_blocks ? max_blocks : static_cast<int>(num_blocks64);
 
     kdequant_mm_int32_fp16<num_per_thread, threads>
         <<<num_blocks, threads, 0, stream>>>(A, rowStats, colStats, out, bias, numRows, numCols, n);
@@ -381,12 +393,13 @@ void dequant_mm_int32_fp16(
 }
 
 void int8VectorQuant(
-    half* __restrict__ A, int8_t* out, float* rowStats, float threshold, int rows, int cols, cudaStream_t stream
+    half* __restrict__ A, int8_t* out, float* rowStats, float threshold, int64_t rows, int cols, cudaStream_t stream
 ) {
+    const int grid = rows > 65535 ? 65535 : static_cast<int>(rows);
     if (threshold == 0.0) {
-        kInt8VectorQuant<half, 1024, 0><<<rows, 1024, 0, stream>>>(A, out, rowStats, threshold, rows, cols);
+        kInt8VectorQuant<half, 1024, 0><<<grid, 1024, 0, stream>>>(A, out, rowStats, threshold, rows, cols);
     } else {
-        kInt8VectorQuant<half, 1024, 1><<<rows, 1024, 0, stream>>>(A, out, rowStats, threshold, rows, cols);
+        kInt8VectorQuant<half, 1024, 1><<<grid, 1024, 0, stream>>>(A, out, rowStats, threshold, rows, cols);
     }
     CUDA_CHECK_RETURN(cudaPeekAtLastError());
 }
@@ -517,72 +530,72 @@ template int igemmlt<8, 1>(
 );
 
 template void quantizeBlockwise<half, 1, General8bit>(
-    float* code, half* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+    float* code, half* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int64_t n
 );
 template void quantizeBlockwise<half, 0, General8bit>(
-    float* code, half* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+    float* code, half* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int64_t n
 );
 template void quantizeBlockwise<half, 0, FP4>(
-    float* code, half* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+    float* code, half* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int64_t n
 );
 template void quantizeBlockwise<half, 0, NF4>(
-    float* code, half* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+    float* code, half* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int64_t n
 );
 template void quantizeBlockwise<float, 1, General8bit>(
-    float* code, float* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+    float* code, float* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int64_t n
 );
 template void quantizeBlockwise<float, 0, General8bit>(
-    float* code, float* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+    float* code, float* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int64_t n
 );
 template void quantizeBlockwise<float, 0, FP4>(
-    float* code, float* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+    float* code, float* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int64_t n
 );
 template void quantizeBlockwise<float, 0, NF4>(
-    float* code, float* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int n
+    float* code, float* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize, const int64_t n
 );
 template void quantizeBlockwise<__nv_bfloat16, 1, General8bit>(
     float* code, __nv_bfloat16* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize,
-    const int n
+    const int64_t n
 );
 template void quantizeBlockwise<__nv_bfloat16, 0, General8bit>(
     float* code, __nv_bfloat16* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize,
-    const int n
+    const int64_t n
 );
 template void quantizeBlockwise<__nv_bfloat16, 0, FP4>(
     float* code, __nv_bfloat16* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize,
-    const int n
+    const int64_t n
 );
 template void quantizeBlockwise<__nv_bfloat16, 0, NF4>(
     float* code, __nv_bfloat16* A, float* absmax, unsigned char* out, float* rand, int rand_offset, int blocksize,
-    const int n
+    const int64_t n
 );
 
 template void dequantizeBlockwise<float, General8bit>(
-    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, cudaStream_t stream
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int64_t n, cudaStream_t stream
 );
 template void dequantizeBlockwise<float, FP4>(
-    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, cudaStream_t stream
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int64_t n, cudaStream_t stream
 );
 template void dequantizeBlockwise<float, NF4>(
-    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int n, cudaStream_t stream
+    float* code, unsigned char* A, float* absmax, float* out, int blocksize, const int64_t n, cudaStream_t stream
 );
 template void dequantizeBlockwise<half, General8bit>(
-    float* code, unsigned char* A, float* absmax, half* out, int blocksize, const int n, cudaStream_t stream
+    float* code, unsigned char* A, float* absmax, half* out, int blocksize, const int64_t n, cudaStream_t stream
 );
 template void dequantizeBlockwise<half, FP4>(
-    float* code, unsigned char* A, float* absmax, half* out, int blocksize, const int n, cudaStream_t stream
+    float* code, unsigned char* A, float* absmax, half* out, int blocksize, const int64_t n, cudaStream_t stream
 );
 template void dequantizeBlockwise<half, NF4>(
-    float* code, unsigned char* A, float* absmax, half* out, int blocksize, const int n, cudaStream_t stream
+    float* code, unsigned char* A, float* absmax, half* out, int blocksize, const int64_t n, cudaStream_t stream
 );
 template void dequantizeBlockwise<__nv_bfloat16, General8bit>(
-    float* code, unsigned char* A, float* absmax, __nv_bfloat16* out, int blocksize, const int n, cudaStream_t stream
+    float* code, unsigned char* A, float* absmax, __nv_bfloat16* out, int blocksize, const int64_t n, cudaStream_t stream
 );
 template void dequantizeBlockwise<__nv_bfloat16, FP4>(
-    float* code, unsigned char* A, float* absmax, __nv_bfloat16* out, int blocksize, const int n, cudaStream_t stream
+    float* code, unsigned char* A, float* absmax, __nv_bfloat16* out, int blocksize, const int64_t n, cudaStream_t stream
 );
 template void dequantizeBlockwise<__nv_bfloat16, NF4>(
-    float* code, unsigned char* A, float* absmax, __nv_bfloat16* out, int blocksize, const int n, cudaStream_t stream
+    float* code, unsigned char* A, float* absmax, __nv_bfloat16* out, int blocksize, const int64_t n, cudaStream_t stream
 );
 
 #define MAKE_optimizer32bit(name, gtype)                                                                               \

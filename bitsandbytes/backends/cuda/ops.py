@@ -1,7 +1,7 @@
 from collections.abc import Sequence
 import ctypes as ct
 from math import prod
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -9,6 +9,21 @@ from bitsandbytes.functional import CUBLAS_Context, _cuda_device_of, _get_tensor
 
 from ..._ops import register_kernel
 from ...cextension import ROCM_WARP_SIZE_64, lib
+
+_INT32_MAX = (1 << 31) - 1
+
+
+def _as_ctypes_int32_or_int64(n: int) -> tuple[Any, bool]:
+    """
+    Return (ctypes_value, uses_int64).
+
+    We intentionally keep the legacy int32 native symbols for the common case,
+    and only dispatch to *_64 symbols when the element count exceeds INT32_MAX.
+    """
+
+    if n > _INT32_MAX:
+        return ct.c_int64(n), True
+    return ct.c_int32(n), False
 
 
 @register_kernel("bitsandbytes::int8_linear_matmul", "cuda")
@@ -55,6 +70,11 @@ def _int8_linear_matmul_impl(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor
     if lda % 4 != 0:
         result = torch.matmul(B.float(), A.float().t()).to(torch.int32)
         return out.copy_(result)
+
+    torch._check(
+        n <= _INT32_MAX,
+        lambda: f"int8_linear_matmul only supports n <= INT32_MAX, got n={n} from shape {shapeB}",
+    )
 
     with _cuda_device_of(A):
         ctx = CUBLAS_Context.get_instance().get_context(A.device)
@@ -105,8 +125,12 @@ def _(
     ptrOut = get_ptr(out)
     ptrRowStats = get_ptr(row_stats)
     ptrColStats = get_ptr(col_stats)
-    numRows = ct.c_int32(prod(A.shape[:-1]))
-    numCols = ct.c_int32(A.shape[-1])
+    numRows_i = prod(A.shape[:-1])
+    numCols_i = A.shape[-1]
+    torch._check(numRows_i <= _INT32_MAX, lambda: f"numRows must be <= INT32_MAX, got {numRows_i}")
+    torch._check(numCols_i <= _INT32_MAX, lambda: f"numCols must be <= INT32_MAX, got {numCols_i}")
+    numRows = ct.c_int32(numRows_i)
+    numCols = ct.c_int32(numCols_i)
 
     # Note: fused bias in the kernel is only supported for fp16
     # TODO(matthewdouglas): Consider supporting bf16 fused bias
@@ -148,12 +172,14 @@ def _(A: torch.Tensor, threshold=0.0):
             outlier_cols = torch.empty(0, device=A.device, dtype=torch.int64)
 
     with _cuda_device_of(A):
-        lib.cint8_vector_quant(
+        rows_arg, use64 = _as_ctypes_int32_or_int64(rows)
+        fn = lib.cint8_vector_quant_64 if use64 else lib.cint8_vector_quant
+        fn(
             get_ptr(A),
             get_ptr(out_row),
             get_ptr(row_stats),
             ct.c_float(threshold),
-            ct.c_int32(rows),
+            rows_arg,
             ct.c_int32(cols),
             _get_tensor_stream(A),
         )
@@ -224,21 +250,22 @@ def _(A: torch.Tensor, code: torch.Tensor, blocksize: int) -> tuple[torch.Tensor
     out = torch.empty_like(A, dtype=torch.uint8)
 
     with _cuda_device_of(A):
+        n_arg, use64 = _as_ctypes_int32_or_int64(n)
         args = (
             get_ptr(code),
             get_ptr(A),
             get_ptr(absmax),
             get_ptr(out),
             ct.c_int32(blocksize),
-            ct.c_int(A.numel()),
+            n_arg,
         )
 
         if A.dtype == torch.float16:
-            lib.cquantize_blockwise_fp16(*args)
+            (lib.cquantize_blockwise_fp16_64 if use64 else lib.cquantize_blockwise_fp16)(*args)
         elif A.dtype == torch.bfloat16:
-            lib.cquantize_blockwise_bf16(*args)
+            (lib.cquantize_blockwise_bf16_64 if use64 else lib.cquantize_blockwise_bf16)(*args)
         elif A.dtype == torch.float32:
-            lib.cquantize_blockwise_fp32(*args)
+            (lib.cquantize_blockwise_fp32_64 if use64 else lib.cquantize_blockwise_fp32)(*args)
         else:
             raise ValueError(f"Blockwise quantization only supports 16/32-bit floats, but got {A.dtype}")
 
@@ -281,22 +308,24 @@ def _dequantize_blockwise_impl(
     )
 
     with _cuda_device_of(A):
+        n = A.numel()
+        n_arg, use64 = _as_ctypes_int32_or_int64(n)
         args = (
             get_ptr(code),
             get_ptr(A),
             get_ptr(absmax),
             get_ptr(out),
             ct.c_int(blocksize),
-            ct.c_int(A.numel()),
+            n_arg,
             _get_tensor_stream(A),
         )
 
         if dtype == torch.float16:
-            lib.cdequantize_blockwise_fp16(*args)
+            (lib.cdequantize_blockwise_fp16_64 if use64 else lib.cdequantize_blockwise_fp16)(*args)
         elif dtype == torch.bfloat16:
-            lib.cdequantize_blockwise_bf16(*args)
+            (lib.cdequantize_blockwise_bf16_64 if use64 else lib.cdequantize_blockwise_bf16)(*args)
         elif dtype == torch.float32:
-            lib.cdequantize_blockwise_fp32(*args)
+            (lib.cdequantize_blockwise_fp32_64 if use64 else lib.cdequantize_blockwise_fp32)(*args)
 
 
 @register_kernel("bitsandbytes::quantize_4bit", "cuda")
@@ -320,30 +349,31 @@ def _(
     out = torch.empty(((n + 1) // (quant_storage.itemsize * 2), 1), device=A.device, dtype=quant_storage)
 
     with _cuda_device_of(A):
+        n_arg, use64 = _as_ctypes_int32_or_int64(n)
         args = (
             None,
             get_ptr(A),
             get_ptr(absmax),
             get_ptr(out),
             ct.c_int32(blocksize),
-            ct.c_int32(n),
+            n_arg,
         )
 
         if A.dtype == torch.bfloat16:
             if quant_type == "fp4":
-                lib.cquantize_blockwise_bf16_fp4(*args)
+                (lib.cquantize_blockwise_bf16_fp4_64 if use64 else lib.cquantize_blockwise_bf16_fp4)(*args)
             else:
-                lib.cquantize_blockwise_bf16_nf4(*args)
+                (lib.cquantize_blockwise_bf16_nf4_64 if use64 else lib.cquantize_blockwise_bf16_nf4)(*args)
         elif A.dtype == torch.float16:
             if quant_type == "fp4":
-                lib.cquantize_blockwise_fp16_fp4(*args)
+                (lib.cquantize_blockwise_fp16_fp4_64 if use64 else lib.cquantize_blockwise_fp16_fp4)(*args)
             else:
-                lib.cquantize_blockwise_fp16_nf4(*args)
+                (lib.cquantize_blockwise_fp16_nf4_64 if use64 else lib.cquantize_blockwise_fp16_nf4)(*args)
         elif A.dtype == torch.float32:
             if quant_type == "fp4":
-                lib.cquantize_blockwise_fp32_fp4(*args)
+                (lib.cquantize_blockwise_fp32_fp4_64 if use64 else lib.cquantize_blockwise_fp32_fp4)(*args)
             else:
-                lib.cquantize_blockwise_fp32_nf4(*args)
+                (lib.cquantize_blockwise_fp32_nf4_64 if use64 else lib.cquantize_blockwise_fp32_nf4)(*args)
 
     return out, absmax
 
@@ -397,31 +427,33 @@ def _dequantize_4bit_impl(
     )
 
     with _cuda_device_of(A):
+        n = out.numel()
+        n_arg, use64 = _as_ctypes_int32_or_int64(n)
         args = (
             None,
             get_ptr(A),
             get_ptr(absmax),
             get_ptr(out),
             ct.c_int(blocksize),
-            ct.c_int32(out.numel()),
+            n_arg,
             _get_tensor_stream(A),
         )
 
         if out.dtype == torch.bfloat16:
             if quant_type == "fp4":
-                lib.cdequantize_blockwise_bf16_fp4(*args)
+                (lib.cdequantize_blockwise_bf16_fp4_64 if use64 else lib.cdequantize_blockwise_bf16_fp4)(*args)
             else:
-                lib.cdequantize_blockwise_bf16_nf4(*args)
+                (lib.cdequantize_blockwise_bf16_nf4_64 if use64 else lib.cdequantize_blockwise_bf16_nf4)(*args)
         elif out.dtype == torch.float16:
             if quant_type == "fp4":
-                lib.cdequantize_blockwise_fp16_fp4(*args)
+                (lib.cdequantize_blockwise_fp16_fp4_64 if use64 else lib.cdequantize_blockwise_fp16_fp4)(*args)
             else:
-                lib.cdequantize_blockwise_fp16_nf4(*args)
+                (lib.cdequantize_blockwise_fp16_nf4_64 if use64 else lib.cdequantize_blockwise_fp16_nf4)(*args)
         elif out.dtype == torch.float32:
             if quant_type == "fp4":
-                lib.cdequantize_blockwise_fp32_fp4(*args)
+                (lib.cdequantize_blockwise_fp32_fp4_64 if use64 else lib.cdequantize_blockwise_fp32_fp4)(*args)
             else:
-                lib.cdequantize_blockwise_fp32_nf4(*args)
+                (lib.cdequantize_blockwise_fp32_nf4_64 if use64 else lib.cdequantize_blockwise_fp32_nf4)(*args)
 
 
 @register_kernel("bitsandbytes::gemv_4bit", "cuda")

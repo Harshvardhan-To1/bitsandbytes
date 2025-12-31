@@ -326,12 +326,9 @@ template <typename T, int BLOCK_SIZE, int NUM_PER_TH, int STOCHASTIC, int DATA_T
 //__launch_bounds__(TH, 4)
 __global__ void kQuantizeBlockwise(
     float* code, T* __restrict__ const A, float* absmax, unsigned char* out, float* __restrict__ const rand,
-    const int rand_offset, const int n
+    const int rand_offset, const int64_t n
 ) {
-    // This can overflow, so we clamp to INT32_MAX. We won't have more elements than this.
-    const int n_full = min(gridDim.x * BLOCK_SIZE, INT32_MAX);
-
-    const int base_idx = blockIdx.x * BLOCK_SIZE;
+    const int64_t base_idx = static_cast<int64_t>(blockIdx.x) * BLOCK_SIZE;
     int valid_items = 0;
 
     T vals[NUM_PER_TH];
@@ -360,8 +357,9 @@ __global__ void kQuantizeBlockwise(
         for (int i = threadIdx.x; i < 256; i += blockDim.x)
             smem_code[i] = code[i];
 
-    for (int64_t i = base_idx; i < n_full; i += gridDim.x * BLOCK_SIZE) {
-        valid_items = min(BLOCK_SIZE, static_cast<int>(n - i));
+    for (int64_t i = base_idx; i < n; i += static_cast<int64_t>(gridDim.x) * BLOCK_SIZE) {
+        const int64_t remaining = n - i;
+        valid_items = remaining >= BLOCK_SIZE ? BLOCK_SIZE : static_cast<int>(remaining);
         local_abs_max = -FLT_MAX;
 
         __syncthreads();
@@ -379,7 +377,7 @@ __global__ void kQuantizeBlockwise(
 
         if (threadIdx.x == 0) {
             smem_absmax_value[0] = 1.0f / local_abs_max;
-            absmax[i / BLOCK_SIZE] = local_abs_max;
+            absmax[static_cast<int64_t>(i / BLOCK_SIZE)] = local_abs_max;
         }
         __syncthreads();
 
@@ -418,19 +416,19 @@ __global__ void kQuantizeBlockwise(
 
         __syncthreads();
         StoreChar(storec).Store(
-            &(out[(DATA_TYPE > 0) ? i / 2 : i]), qvals, (DATA_TYPE > 0) ? (valid_items + 1) / 2 : valid_items
+            &(out[(DATA_TYPE > 0) ? (i / 2) : i]), qvals, (DATA_TYPE > 0) ? (valid_items + 1) / 2 : valid_items
         );
     }
 }
 
 template <typename T, int TILE_SIZE, int THREADS, int NUM_PER_TH, int DATA_TYPE>
 __global__ void
-    kDequantizeBlockwise(float* code, unsigned char* A, float* absmax, T* out, const int blocksize, const int n) {
+    kDequantizeBlockwise(float* code, unsigned char* A, float* absmax, T* out, const int blocksize, const int64_t n) {
 
-    const int n_load = (gridDim.x * TILE_SIZE);
+    const int64_t n_in = (DATA_TYPE > 0) ? ((n + 1) / 2) : n;
     int valid_items_load = 0;
     int valid_items_store = 0;
-    const int base_idx = (blockIdx.x * TILE_SIZE);
+    const int64_t base_idx = static_cast<int64_t>(blockIdx.x) * TILE_SIZE;
 
     T vals[NUM_PER_TH * ((DATA_TYPE > 0) ? 2 : 1)];
     unsigned char qvals[NUM_PER_TH];
@@ -442,20 +440,25 @@ __global__ void
     __shared__ typename LoadChar::TempStorage loadchar;
     __shared__ typename StoreT::TempStorage storet;
 
-    for (int i = base_idx; i < n_load; i += gridDim.x * TILE_SIZE) {
+    for (int64_t i = base_idx; i < n_in; i += static_cast<int64_t>(gridDim.x) * TILE_SIZE) {
         if (DATA_TYPE > 0) {
-            // Cast n to int64_t to avoid overflow for large n
-            valid_items_load = min(TILE_SIZE, static_cast<int>((static_cast<int64_t>(n) + 1) / 2) - i);
-            valid_items_store = min(TILE_SIZE * 2, n - i * 2);
+            const int64_t remaining_in = n_in - i;
+            const int64_t remaining_out = n - (i * 2);
+            valid_items_load = remaining_in >= TILE_SIZE ? TILE_SIZE : static_cast<int>(remaining_in);
+            valid_items_store = remaining_out >= (TILE_SIZE * 2) ? (TILE_SIZE * 2) : static_cast<int>(remaining_out);
         } else {
-            valid_items_load = min(TILE_SIZE, n - i);
+            const int64_t remaining = n - i;
+            valid_items_load = remaining >= TILE_SIZE ? TILE_SIZE : static_cast<int>(remaining);
             valid_items_store = valid_items_load;
         }
 
         // Since blocksize will always be a power-of-2, we avoid more expensive
         // division by the blocksize and instead use a shift operation.
         // This is equivalent to (i+threadId.x*NUM_PER_TH)/blocksize.
-        local_abs_max = __ldg(&absmax[(i + threadIdx.x * NUM_PER_TH) >> (31 - __clz(blocksize))]);
+        local_abs_max = __ldg(
+            &absmax[(static_cast<int64_t>(i) + static_cast<int64_t>(threadIdx.x) * NUM_PER_TH) >>
+                    (31 - __clz(blocksize))]
+        );
 
         __syncthreads();
         LoadChar(loadchar).Load(&(A[i]), qvals, valid_items_load, 128);
@@ -484,7 +487,7 @@ __global__ void
         }
 
         __syncthreads();
-        StoreT(storet).Store(&(out[(DATA_TYPE > 0) ? i * 2 : i]), vals, valid_items_store);
+        StoreT(storet).Store(&(out[(DATA_TYPE > 0) ? (i * 2) : i]), vals, valid_items_store);
     }
 }
 
@@ -1765,7 +1768,7 @@ __launch_bounds__(256, 3) __global__ void kOptimizerStatic8bit1StateBlockwise(
 //  out [rows, cols]
 template <typename T, int THREADS, int SPARSE_DECOMP>
 __launch_bounds__(1024, BNB_MAX_THREADS_PER_SM / 1024) __global__
-    void kInt8VectorQuant(T* __restrict__ A, int8_t* out, float* rowStats, float threshold, int rows, int cols) {
+    void kInt8VectorQuant(T* __restrict__ A, int8_t* out, float* rowStats, float threshold, int64_t rows, int cols) {
 
     using BlockReduceT = cub::BlockReduce<T, THREADS>;
 
@@ -1779,51 +1782,54 @@ __launch_bounds__(1024, BNB_MAX_THREADS_PER_SM / 1024) __global__
     __shared__ typename BlockReduceT::TempStorage temp_storage;
     __shared__ T smem_row_absmax;
 
-    const int row_id = blockIdx.x;
-    const T* row_data = A + (row_id * cols);
+    for (int64_t row_id = static_cast<int64_t>(blockIdx.x); row_id < rows; row_id += static_cast<int64_t>(gridDim.x)) {
+        const T* row_data = A + (row_id * static_cast<int64_t>(cols));
 
-    // Threads will read the row values in a striped access pattern and find a local absmax.
-    T row_local_absmax = -FLT_MIN;
-    for (int i = threadIdx.x; i < cols; i += THREADS) {
-        const T absval = fabsf(__ldcs(&(row_data[i])));
+        // Threads will read the row values in a striped access pattern and find a local absmax.
+        T row_local_absmax = -FLT_MIN;
+        for (int i = threadIdx.x; i < cols; i += THREADS) {
+            const T absval = fabsf(__ldcs(&(row_data[i])));
 
-        // For sparse decomposition, values outside of the threshold are not to be
-        // included when calculating the row's absmax.
-        if constexpr (SPARSE_DECOMP) {
-            row_local_absmax = fmaxf(row_local_absmax, absval < T(threshold) ? absval : row_local_absmax);
-        } else {
-            row_local_absmax = fmaxf(row_local_absmax, absval);
+            // For sparse decomposition, values outside of the threshold are not to be
+            // included when calculating the row's absmax.
+            if constexpr (SPARSE_DECOMP) {
+                row_local_absmax = fmaxf(row_local_absmax, absval < T(threshold) ? absval : row_local_absmax);
+            } else {
+                row_local_absmax = fmaxf(row_local_absmax, absval);
+            }
         }
-    }
 
-    // Reduce thread-local absmax across the block.
-    const T row_absmax = BlockReduceT(temp_storage).Reduce(row_local_absmax, CUB_REDUCTIONOP_MAX, cols);
-    if (threadIdx.x == 0) {
-        // Save our block's absmax to shared memory for the quantization step.
-        rowStats[row_id] = smem_row_absmax = row_absmax;
-    }
-    __syncthreads();
-
-    // Quantize row-wise.
-    const float scale = __fdividef(127.0f, smem_row_absmax);
-    for (int i = threadIdx.x; i < cols; i += THREADS) {
-        float val = row_data[i];
-
-        if constexpr (SPARSE_DECOMP) {
-            // For sparse decomposition, we do not want to quantize the outliers.
-            // Instead they're zeroed out.
-            out[row_id * cols + i] = fabs(val) < threshold ? __float2int_rn(val * scale) : 0;
-        } else {
-            out[row_id * cols + i] = __float2int_rn(val * scale);
+        // Reduce thread-local absmax across the block.
+        const T row_absmax = BlockReduceT(temp_storage).Reduce(row_local_absmax, CUB_REDUCTIONOP_MAX, cols);
+        if (threadIdx.x == 0) {
+            // Save our block's absmax to shared memory for the quantization step.
+            rowStats[row_id] = smem_row_absmax = row_absmax;
         }
+        __syncthreads();
+
+        // Quantize row-wise.
+        const float scale = __fdividef(127.0f, smem_row_absmax);
+        for (int i = threadIdx.x; i < cols; i += THREADS) {
+            float val = row_data[i];
+
+            const int64_t out_idx = row_id * static_cast<int64_t>(cols) + i;
+            if constexpr (SPARSE_DECOMP) {
+                // For sparse decomposition, we do not want to quantize the outliers.
+                // Instead they're zeroed out.
+                out[out_idx] = fabs(val) < threshold ? __float2int_rn(val * scale) : 0;
+            } else {
+                out[out_idx] = __float2int_rn(val * scale);
+            }
+        }
+        __syncthreads();
     }
 }
 
 template __global__ void kInt8VectorQuant<half, 1024, 0>(
-    half* __restrict__ A, int8_t* out, float* rowStats, float threshold, int rows, int cols
+    half* __restrict__ A, int8_t* out, float* rowStats, float threshold, int64_t rows, int cols
 );
 template __global__ void kInt8VectorQuant<half, 1024, 1>(
-    half* __restrict__ A, int8_t* out, float* rowStats, float threshold, int rows, int cols
+    half* __restrict__ A, int8_t* out, float* rowStats, float threshold, int64_t rows, int cols
 );
 
 #define MM_DEQUANT_CONST 6.200012e-05f // 1.0f/(127.0f*127.0f)
@@ -1831,12 +1837,13 @@ template __global__ void kInt8VectorQuant<half, 1024, 1>(
 template <int ITEMS_PER_THREAD, int THREADS>
 __global__ void kdequant_mm_int32_fp16(
     int* __restrict__ const A, float* __restrict__ const rowStats, float* __restrict__ const colStats, half* out,
-    half* __restrict__ const bias, const int numRows, const int numCols, const int n
+    half* __restrict__ const bias, const int numRows, const int numCols, const int64_t n
 ) {
-    const int n_out = numRows * numCols;
+    (void)n;
+    const int64_t n_out = static_cast<int64_t>(numRows) * static_cast<int64_t>(numCols);
 
-    int block_offset = blockIdx.x * THREADS * ITEMS_PER_THREAD;
-    int thread_offset = threadIdx.x * ITEMS_PER_THREAD;
+    const int64_t block_offset = static_cast<int64_t>(blockIdx.x) * THREADS * ITEMS_PER_THREAD;
+    const int64_t thread_offset = static_cast<int64_t>(threadIdx.x) * ITEMS_PER_THREAD;
 
     int local_values[ITEMS_PER_THREAD];
     half local_output[ITEMS_PER_THREAD];
@@ -1848,22 +1855,24 @@ __global__ void kdequant_mm_int32_fp16(
     typedef cub::BlockLoad<int, THREADS, ITEMS_PER_THREAD, cub::BLOCK_LOAD_VECTORIZE> LoadInt32;
     __shared__ typename LoadInt32::TempStorage loadint32;
 
-    int row_idx, col_idx;
+    int64_t row_idx, col_idx;
 
 #pragma unroll ITEMS_PER_THREAD
     for (int j = 0; j < ITEMS_PER_THREAD; ++j) {
 
-        row_idx = (block_offset + thread_offset + j) / numCols;
-        col_idx = (block_offset + thread_offset + j) % numCols;
+        const int64_t global_idx = block_offset + thread_offset + j;
+        row_idx = global_idx / static_cast<int64_t>(numCols);
+        col_idx = global_idx - row_idx * static_cast<int64_t>(numCols);
 
-        local_colStats[j] = col_idx >= numCols ? 0.0f : __ldg(&colStats[col_idx]);
-        local_rowStats[j] = row_idx >= numRows ? 0.0f : __ldg(&rowStats[row_idx]);
-        local_biasValue[j] = ((bias == nullptr) || col_idx >= numCols) ? 0.0f : __half2float(bias[col_idx]);
+        local_colStats[j] = col_idx >= static_cast<int64_t>(numCols) ? 0.0f : __ldg(&colStats[col_idx]);
+        local_rowStats[j] = row_idx >= static_cast<int64_t>(numRows) ? 0.0f : __ldg(&rowStats[row_idx]);
+        local_biasValue[j] =
+            ((bias == nullptr) || col_idx >= static_cast<int64_t>(numCols)) ? 0.0f : __half2float(bias[col_idx]);
     }
 
     // Each block loads THREADS * ITEMS_PER_THREAD values from A
-    int valid_items =
-        block_offset + THREADS * ITEMS_PER_THREAD < n_out ? THREADS * ITEMS_PER_THREAD : n_out - block_offset;
+    const int64_t remaining = n_out - block_offset;
+    const int valid_items = remaining >= (THREADS * ITEMS_PER_THREAD) ? (THREADS * ITEMS_PER_THREAD) : static_cast<int>(remaining);
     LoadInt32(loadint32).Load(&(A[block_offset]), local_values, valid_items, 0);
 
 #pragma unroll ITEMS_PER_THREAD
@@ -1875,7 +1884,7 @@ __global__ void kdequant_mm_int32_fp16(
 
 #pragma unroll ITEMS_PER_THREAD
     for (int j = 0; j < ITEMS_PER_THREAD; j++) {
-        int outIdx = block_offset + thread_offset + j;
+        const int64_t outIdx = block_offset + thread_offset + j;
         if (outIdx < n_out) {
             out[outIdx] = local_output[j];
         }
@@ -2042,8 +2051,8 @@ __global__ void kgemm_4bit_inference_naive(
 
     const int warp_idx = threadIdx.x / 32;
     const int warp_lane = threadIdx.x % 32;
-    const int row_B = (THREADS / 32) * blockIdx.x + warp_idx;
-    const int offset_B = ldb * row_B;
+    const int64_t row_B = static_cast<int64_t>(THREADS / 32) * static_cast<int64_t>(blockIdx.x) + warp_idx;
+    const int64_t offset_B = static_cast<int64_t>(ldb) * row_B;
     const int num_values_8bit = num_values_4bit / 2;
     float local_C = 0.0f;
 
@@ -2067,20 +2076,21 @@ __global__ void kgemm_4bit_inference_naive(
         // Since blocksize will always be a power-of-2, we avoid more expensive
         // division by the blocksize and instead use a shift operation.
         // This is equivalent to (i+threadId.x*NUM_PER_TH)/blocksize.
-        const int absidx = ((2 * offset_B) + inner_idx) >> (31 - __clz(blocksize));
+        const int64_t absidx =
+            ((static_cast<int64_t>(2) * offset_B) + static_cast<int64_t>(inner_idx)) >> (31 - __clz(blocksize));
 
         local_absmax = __ldg(&(absmax[absidx]));
 
-        if (row_B < M) {
+        if (row_B < static_cast<int64_t>(M)) {
             if ((inner_idx_halved + num_values_8bit) < (K / 2)) {
                 // this is the most important for performance considerations
                 reinterpret_cast<int4(&)[num_values_8bit]>(local_B_4bit)[0] =
-                    reinterpret_cast<int4*>(B)[(offset_B + (inner_idx_halved)) / (num_values_8bit)];
+                    reinterpret_cast<int4*>(B)[(offset_B + static_cast<int64_t>(inner_idx_halved)) / (num_values_8bit)];
             } else {
 #pragma unroll
                 for (int j = 0; j < (num_values_8bit); j++)
                     if ((inner_idx_halved) + j < (K / 2))
-                        local_B_4bit[j] = B[offset_B + inner_idx_halved + j];
+                        local_B_4bit[j] = B[offset_B + static_cast<int64_t>(inner_idx_halved + j)];
                     else
                         local_B_4bit[j] = 0b01110111;
             }
@@ -2140,7 +2150,7 @@ __global__ void kgemm_4bit_inference_naive(
 
     local_C = WarpReduce(temp_storage[warp_idx]).Sum(local_C);
 
-    if (row_B < M && warp_lane == 0)
+    if (row_B < static_cast<int64_t>(M) && warp_lane == 0)
         out[row_B] = T(local_C);
 }
 
@@ -2209,7 +2219,7 @@ template __global__ void kspmm_coo_very_sparse_naive<signed char, 32, 8>(
 
 template __global__ void kdequant_mm_int32_fp16<4, 512>(
     int* __restrict__ const A, float* __restrict__ const rowStats, float* __restrict__ const colStats, half* out,
-    half* __restrict__ const bias, const int numRows, const int numCols, const int n
+    half* __restrict__ const bias, const int numRows, const int numCols, const int64_t n
 );
 
 template __device__ unsigned char dQuantize<0>(float* smem_code, const float rand, float x);
@@ -2369,7 +2379,7 @@ template __global__ void
 #define MAKE_kQuantizeBlockwise(dtype, blocksize, num_per_thread, stochastic, data_type_name)                          \
     template __global__ void kQuantizeBlockwise<dtype, blocksize, num_per_thread, stochastic, data_type_name>(         \
         float* code, dtype* __restrict__ const A, float* absmax, unsigned char* out, float* __restrict__ const rand,   \
-        const int rand_offset, const int n                                                                             \
+        const int rand_offset, const int64_t n                                                                          \
     );
 
 MAKE_kQuantizeBlockwise(half, 4096, 4, 0, General8bit)
@@ -2441,31 +2451,31 @@ MAKE_kQuantizeBlockwise(__nv_bfloat16, 128, 2, 0, NF4)
 MAKE_kQuantizeBlockwise(__nv_bfloat16, 64, 2, 0, NF4)
 
 template __global__ void kDequantizeBlockwise<half, 512, 64, 8, FP4>(
-    float* code, unsigned char* A, float* absmax, half* out, const int blocksize, const int n
+    float* code, unsigned char* A, float* absmax, half* out, const int blocksize, const int64_t n
 );
 template __global__ void kDequantizeBlockwise<half, 512, 64, 8, General8bit>(
-    float* code, unsigned char* A, float* absmax, half* out, const int blocksize, const int n
+    float* code, unsigned char* A, float* absmax, half* out, const int blocksize, const int64_t n
 );
 template __global__ void kDequantizeBlockwise<half, 512, 64, 8, NF4>(
-    float* code, unsigned char* A, float* absmax, half* out, const int blocksize, const int n
+    float* code, unsigned char* A, float* absmax, half* out, const int blocksize, const int64_t n
 );
 template __global__ void kDequantizeBlockwise<float, 512, 64, 8, FP4>(
-    float* code, unsigned char* A, float* absmax, float* out, const int blocksize, const int n
+    float* code, unsigned char* A, float* absmax, float* out, const int blocksize, const int64_t n
 );
 template __global__ void kDequantizeBlockwise<float, 512, 64, 8, General8bit>(
-    float* code, unsigned char* A, float* absmax, float* out, const int blocksize, const int n
+    float* code, unsigned char* A, float* absmax, float* out, const int blocksize, const int64_t n
 );
 template __global__ void kDequantizeBlockwise<float, 512, 64, 8, NF4>(
-    float* code, unsigned char* A, float* absmax, float* out, const int blocksize, const int n
+    float* code, unsigned char* A, float* absmax, float* out, const int blocksize, const int64_t n
 );
 template __global__ void kDequantizeBlockwise<__nv_bfloat16, 512, 64, 8, FP4>(
-    float* code, unsigned char* A, float* absmax, __nv_bfloat16* out, const int blocksize, const int n
+    float* code, unsigned char* A, float* absmax, __nv_bfloat16* out, const int blocksize, const int64_t n
 );
 template __global__ void kDequantizeBlockwise<__nv_bfloat16, 512, 64, 8, General8bit>(
-    float* code, unsigned char* A, float* absmax, __nv_bfloat16* out, const int blocksize, const int n
+    float* code, unsigned char* A, float* absmax, __nv_bfloat16* out, const int blocksize, const int64_t n
 );
 template __global__ void kDequantizeBlockwise<__nv_bfloat16, 512, 64, 8, NF4>(
-    float* code, unsigned char* A, float* absmax, __nv_bfloat16* out, const int blocksize, const int n
+    float* code, unsigned char* A, float* absmax, __nv_bfloat16* out, const int blocksize, const int64_t n
 );
 
 #define MAKE_OptimizerStatic8bit2StateBlockwise(oname, gtype, block_size, num_per_thread)                              \
